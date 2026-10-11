@@ -1,7 +1,7 @@
 
 from entities import *
 import yfinance as yf
-
+import threading
 
 class Backtester(State):
 
@@ -13,35 +13,39 @@ class Backtester(State):
     def enter(self):
         Core.imgui_io.font_global_scale = 2
         Camera.set_perspective("2d")
-        implot.push_style_color(implot.Col.AxisBg, imgui.Vec4(0.1, 0.1, 0.1, 1.0))
-        implot.push_style_color(implot.Col.AxisBgHovered, imgui.Vec4(0.15, 0.15, 0.15, 1.0))
-        implot.push_style_color(implot.Col.AxisBgActive, imgui.Vec4(0.2, 0.2, 0.2, 1.0))
-        implot.push_style_color(implot.Col.FrameBg, imgui.Vec4(0.1, 0.1, 0.1, 1.0))
-        
+
+        # YFinance Warmup
+        yf.Ticker("AAPL").history(period="1d", interval="1d")
+
         self.ticker = "AAPL"
-
-        self.time_periods = ["1d", "5d", "1mo", "6mo", "1y", "5y", "max"]
-        self.time_period = 0
-        self.intervals = ["1m", "2m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]
-        self.interval = 5
-
         self.stock_data = None
-        self.xs = None
-        self.close_ys, self.open_ys, self.low_ys, self.high_ys = None, None, None, None
+        self.stocks = {}
+        self.is_searching = False
 
-        self.close_spec = implot.Spec()
-        self.close_spec.line_weight = 2.5
-        self.close_spec.line_color = imgui.Vec4(1.0, 0.0, 0.0, 1.0)
-        self.open_spec = implot.Spec()
-        self.open_spec.line_weight = 2.5
-        self.open_spec.line_color = imgui.Vec4(0.0, 1.0, 0.0, 1.0)
+        self.time_periods = ["1d", "1wk", "1mo", "6mo", "1y", "3y", "5y"]
+        self.time_period = 0
+        self.intervals = [
+            ["1m", "5m", "30m", "1h", "1d"],
+            ["1m", "5m", "30m", "1h", "1d", "1wk"],
+            ["5m", "30m", "1h", "1d", "1wk", "1mo"],
+            ["1d", "1wk", "1mo"],
+            ["1d", "1wk", "1mo"],
+            ["1d", "1wk", "1mo"],
+            ["1d", "1wk", "1mo"]
+        ]
+        self.interval = 0
 
-        self.y_min_next, self.y_max_next = 0, 1
-        
-        self.show_candles = True
+        self.plotter = Plotter()
+
         self.simulating = False
         self.auto_tick = False
         self.auto_tick_rate = 10
+
+        self.search_query = ""
+        self.search_results = []
+        self.selected_search_index = 0
+
+        self.logs = []
 
     def exit(self):
         pass
@@ -55,37 +59,9 @@ class Backtester(State):
     def render(self):
         pass
 
-    @staticmethod
-    def draw_candlesticks_drawlist(xs, opens, closes, lows, highs, candle_width_px=8.0):
-        draw_list = implot.get_plot_draw_list()
-        
-        plot_min = implot.get_plot_pos() # topleft
-        plot_size = implot.get_plot_size()
-        plot_max = imgui.Vec2(plot_min.x + plot_size.x, plot_min.y + plot_size.y) # bottomright
-
-        draw_list.push_clip_rect(plot_min, plot_max, intersect_with_current=True)
-
-        green_col = imgui.get_color_u32(imgui.Vec4(0.1, 0.8, 0.3, 1.0))
-        red_col   = imgui.get_color_u32(imgui.Vec4(0.9, 0.2, 0.2, 1.0))
-        half_width = candle_width_px * 0.5
-
-        for i in range(len(xs)):
-            p_high = implot.plot_to_pixels(implot.Point(xs[i], highs[i]))
-            p_low  = implot.plot_to_pixels(implot.Point(xs[i], lows[i]))
-            p_open = implot.plot_to_pixels(implot.Point(xs[i], opens[i]))
-            p_close= implot.plot_to_pixels(implot.Point(xs[i], closes[i]))
-
-            color = green_col if closes[i] >= opens[i] else red_col
-            draw_list.add_line(p_high, p_low, color, 1.5)
-
-            top_y = min(p_open.y, p_close.y)
-            bot_y = max(p_open.y, p_close.y)
-            if bot_y - top_y < 1.0:
-                bot_y = top_y + 1.0
-            p_min = imgui.Vec2(p_open.x - half_width, top_y)
-            p_max = imgui.Vec2(p_open.x + half_width, bot_y)
-            draw_list.add_rect_filled(p_min, p_max, color)
-        draw_list.pop_clip_rect()
+    def log(self, message: str):
+        self.logs.insert(0, str(message))
+        if len(self.logs) > 100: self.logs.pop()
 
     def render_ui(self):
         imgui.set_next_window_pos(imgui.Vec2(0, 0))
@@ -97,31 +73,73 @@ class Backtester(State):
         imgui.separator()
         
         if imgui.tree_node("Online"):
-            imgui.text("Ticker      "); imgui.same_line()
+            imgui.text("Search  ")
+            imgui.same_line()
             imgui.set_next_item_width(w / 3)
-            _, self.ticker = imgui.input_text("##Ticker", self.ticker)
+            changed, self.search_query = imgui.input_text("##SearchQuery", self.search_query)
             
+            def fetch_search_results(query):
+                try:
+                    search_obj = yf.Search(query, max_results=5)
+                    self.search_results = search_obj.quotes
+                except Exception:
+                    self.search_results = []
+                finally:
+                    self.is_searching = False
+
+            if (changed and len(self.search_query) > 2):
+                if not self.is_searching:
+                    self.is_searching = True
+                    threading.Thread(target=fetch_search_results, args=(self.search_query,), daemon=True).start()
+
+            if self.is_searching:
+                imgui.text("Searching")
+            elif self.search_results:
+                result_labels = [
+                    f"{item.get('symbol', '')} - {item.get('shortname', item.get('longname', 'Unknown'))}" 
+                    for item in self.search_results
+                ]
+                
+                imgui.text("Results ")
+                imgui.same_line()
+                imgui.set_next_item_width(w / 2)
+                
+                if self.selected_search_index >= len(result_labels):
+                    self.selected_search_index = 0
+                    
+                _, self.selected_search_index = imgui.combo(
+                    "##SearchResults", self.selected_search_index, result_labels
+                )
+                
+                if imgui.button("Select"):
+                    selected_item = self.search_results[self.selected_search_index]
+                    self.ticker = selected_item.get('symbol', self.ticker)
+
+            imgui.separator()
+            imgui.text("Ticker:      " + self.ticker);            
             imgui.text("Time Period "); imgui.same_line()
             imgui.set_next_item_width(w / 3)
             _, self.time_period = imgui.combo("##TP", self.time_period, self.time_periods)
             
             imgui.text("Interval    "); imgui.same_line()
             imgui.set_next_item_width(w / 3)
-            _, self.interval = imgui.combo("##INT", self.interval, self.intervals)
+            if self.interval > len(self.intervals[self.time_period]):
+                self.interval = 0
+            _, self.interval = imgui.combo("##INT", self.interval, self.intervals[self.time_period])
             
             if imgui.button("Download"):
-                ticker = yf.Ticker(self.ticker)
-                self.stock_data = ticker.history(period=self.time_periods[self.time_period], interval=self.intervals[self.interval])
-                self.xs = [timestamp.timestamp() for timestamp in self.stock_data.index]
-                self.close_ys = self.stock_data["Close"].astype(float).tolist()    
-                self.open_ys = self.stock_data["Open"].astype(float).tolist()    
-                self.low_ys = self.stock_data["Low"].astype(float).tolist()    
-                self.high_ys = self.stock_data["High"].astype(float).tolist()    
+                if self.ticker in self.stocks:
+                    del self.stocks[self.ticker]
+                self.stocks[self.ticker] = Stock(self.ticker)
+                self.stocks[self.ticker].set_history(self.time_periods[self.time_period], self.intervals[self.time_period][self.interval])
+                self.stocks[self.ticker].fetch_data()
+                self.plotter.set_stock(self.stocks[self.ticker])
+                self.log(f"Downloading... {self.ticker}")
             imgui.tree_pop()
 
         if imgui.tree_node("Offline"):
             imgui.text_colored(imgui.Vec4(0.0, 1.0, 0.0, 1.0), "In-Development")
-            imgui.tree_pop()    
+            imgui.tree_pop()
         imgui.end_group()
 
         imgui.text("")
@@ -129,7 +147,7 @@ class Backtester(State):
         imgui.begin_group()
         imgui.text("Indicators")
         imgui.separator()
-        _, self.show_candles = imgui.checkbox("Candles", self.show_candles)
+        _, self.plotter.show_candles = imgui.checkbox("Candles", self.plotter.show_candles)
         imgui.end_group()
 
         imgui.text("")
@@ -154,41 +172,22 @@ class Backtester(State):
         imgui.end()
 
         imgui.set_next_window_pos(imgui.Vec2(Core.qw, Core.qh * 3))
-        imgui.set_next_window_size(imgui.Vec2(Core.qw * 3, Core.qh))
+        imgui.set_next_window_size(imgui.Vec2(Core.qw * 2, Core.qh))
         imgui.begin("Information", flags=imgui.WindowFlags.NoCollapse | imgui.WindowFlags.NoResize)
+        imgui.end()
+
+        imgui.set_next_window_pos(imgui.Vec2(Core.qw * 3, Core.qh * 3))
+        imgui.set_next_window_size(imgui.Vec2(Core.qw, Core.qh))
+        imgui.begin("Log", flags=imgui.WindowFlags.NoCollapse | imgui.WindowFlags.NoResize)
+        for l in self.logs:
+            imgui.text(l)
         imgui.end()
 
         imgui.set_next_window_pos(imgui.Vec2(Core.qw, 0))
         imgui.set_next_window_size(imgui.Vec2(Core.qw * 3, Core.qh * 3))
         imgui.begin("Chart", flags=imgui.WindowFlags.NoCollapse | imgui.WindowFlags.NoResize)
-        style = implot.get_style()
-        style.plot_padding = imgui.Vec2(0, 0)
-        style.plot_border_size = 1.0
-        if self.xs:
-            implot.set_next_axis_limits(implot.Axis.Y1, self.y_min_next, self.y_max_next, imgui.Cond.Always)
-            if implot.begin_plot(f"{self.ticker} Price", size=imgui.Vec2(-1, -1)):
-                implot.setup_axis_scale(implot.Axis.X1, implot.Scale.Time)
-                implot.setup_axes(x_flags=implot.AxisFlags.NoLabel, 
-                                  y_flags=implot.AxisFlags.RangeFit | implot.AxisFlags.AutoFit)
-
-                implot.plot_line_xy("Open", self.xs, self.open_ys, self.open_spec)
-                implot.plot_line_xy("Close", self.xs, self.close_ys, self.close_spec)
-                
-                if self.show_candles:
-                    self.draw_candlesticks_drawlist(self.xs, self.open_ys, self.close_ys, self.low_ys, self.high_ys)
-                
-                x_range = implot.get_plot_limits().x
-
-                visible_lows = [self.low_ys[i] for i in range(len(self.xs)) if x_range.min <= self.xs[i] <= x_range.max]
-                visible_highs = [self.high_ys[i] for i in range(len(self.xs)) if x_range.min <= self.xs[i] <= x_range.max]
-                if visible_lows and visible_highs:
-                    v_min = min(visible_lows)
-                    v_max = max(visible_highs)
-                    v_pad = (v_max - v_min) * 0.05 if v_max != v_min else 1.0
-                    self.y_min_next = v_min - v_pad
-                    self.y_max_next = v_max + v_pad
-                implot.end_plot()
+        if self.stocks and self.stocks[self.ticker].has_data:
+            self.plotter.plot()
         imgui.end()
-
 
 Core.add_state(Backtester)
