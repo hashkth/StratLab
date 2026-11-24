@@ -3,4 +3,4 @@ imgui.ini
 .vscode
 data/
 exports/
-shaders/
+.shaders/
